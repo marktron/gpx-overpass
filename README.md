@@ -2,7 +2,7 @@
 
 A browser-based tool that generates buffered polygon queries for [Overpass Turbo](https://overpass-turbo.eu) from GPX routes. Upload a cycling, hiking, or running route and find nearby amenities within a configurable corridor.
 
-**[Try it live →](https://yourusername.github.io/your-repo-name/)**
+**[Try it live →](https://marktron.github.io/gpx-overpass/)**
 
 ## How it works
 
