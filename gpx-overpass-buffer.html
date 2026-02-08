@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPX → Overpass Buffer</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useMemo, useRef } = React;
+
+// ════════════════════════════════════════════════════════
+// GEO UTILITIES
+// ════════════════════════════════════════════════════════
+const R = 6371000;
+const rad = (d) => (d * Math.PI) / 180;
+const deg = (r) => (r * 180) / Math.PI;
+
+function dist(a, b) {
+  const dLat = rad(b.lat - a.lat),
+    dLon = rad(b.lon - a.lon);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
+
+function brg(a, b) {
+  if (a.lat === b.lat && a.lon === b.lon) return 0;
+  const dL = rad(b.lon - a.lon);
+  return Math.atan2(
+    Math.sin(dL) * Math.cos(rad(b.lat)),
+    Math.cos(rad(a.lat)) * Math.sin(rad(b.lat)) -
+      Math.sin(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.cos(dL)
+  );
+}
+
+function move(p, bearing, d) {
+  const la = rad(p.lat),
+    lo = rad(p.lon),
+    dr = d / R;
+  const la2 = Math.asin(
+    Math.sin(la) * Math.cos(dr) +
+      Math.cos(la) * Math.sin(dr) * Math.cos(bearing)
+  );
+  const lo2 =
+    lo +
+    Math.atan2(
+      Math.sin(bearing) * Math.sin(dr) * Math.cos(la),
+      Math.cos(dr) - Math.sin(la) * Math.sin(la2)
+    );
+  return { lat: deg(la2), lon: deg(lo2) };
+}
+
+function xtrack(p, a, b) {
+  if (a.lat === b.lat && a.lon === b.lon) return dist(a, p);
+  const d = dist(a, p) / R;
+  const val = Math.sin(d) * Math.sin(brg(a, p) - brg(a, b));
+  return Math.abs(Math.asin(Math.max(-1, Math.min(1, val)))) * R;
+}
+
+// ════════════════════════════════════════════════════════
+// DOUGLAS-PEUCKER SIMPLIFICATION
+// ════════════════════════════════════════════════════════
+function dpSimplify(pts, tol) {
+  if (pts.length <= 2) return pts;
+  let mx = 0, mi = 0;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const d = xtrack(pts[i], pts[0], pts[pts.length - 1]);
+    if (d > mx) { mx = d; mi = i; }
+  }
+  if (mx > tol) {
+    const left = dpSimplify(pts.slice(0, mi + 1), tol);
+    const right = dpSimplify(pts.slice(mi), tol);
+    return [...left.slice(0, -1), ...right];
+  }
+  return [pts[0], pts[pts.length - 1]];
+}
+
+function simplify(pts, target) {
+  if (pts.length <= target) return [...pts];
+  let lo = 1, hi = 100000;
+  for (let i = 0; i < 30; i++) {
+    const mid = (lo + hi) / 2;
+    const s = dpSimplify(pts, mid);
+    if (s.length > target) lo = mid;
+    else hi = mid;
+  }
+  return dpSimplify(pts, hi);
+}
+
+// ════════════════════════════════════════════════════════
+// POLYLINE BUFFERING
+// ════════════════════════════════════════════════════════
+function bufferTrack(pts, meters) {
+  if (pts.length < 2) return [];
+  const left = [], right = [];
+  for (let i = 0; i < pts.length; i++) {
+    let b;
+    if (i === 0) b = brg(pts[0], pts[1]);
+    else if (i === pts.length - 1) b = brg(pts[i - 1], pts[i]);
+    else {
+      const b1 = brg(pts[i - 1], pts[i]);
+      const b2 = brg(pts[i], pts[i + 1]);
+      b = Math.atan2(
+        (Math.sin(b1) + Math.sin(b2)) / 2,
+        (Math.cos(b1) + Math.cos(b2)) / 2
+      );
+    }
+    left.push(move(pts[i], b - Math.PI / 2, meters));
+    right.push(move(pts[i], b + Math.PI / 2, meters));
+  }
+  const N = 8;
+  const endCap = [], startCap = [];
+  const eb = brg(pts[pts.length - 2], pts[pts.length - 1]);
+  for (let i = 0; i <= N; i++)
+    endCap.push(move(pts[pts.length - 1], eb - Math.PI / 2 + (Math.PI * i) / N, meters));
+  const sb = brg(pts[0], pts[1]);
+  for (let i = 0; i <= N; i++)
+    startCap.push(move(pts[0], sb + Math.PI / 2 + (Math.PI * i) / N, meters));
+  return [...left, ...endCap, ...right.reverse(), ...startCap];
+}
+
+// ════════════════════════════════════════════════════════
+// GPX PARSING
+// ════════════════════════════════════════════════════════
+function parseGPX(xml) {
+  const doc = new DOMParser().parseFromString(xml, "text/xml");
+  let pts = [...doc.querySelectorAll("trkpt")].map((p) => ({
+    lat: +p.getAttribute("lat"), lon: +p.getAttribute("lon"),
+  }));
+  if (!pts.length)
+    pts = [...doc.querySelectorAll("rtept")].map((p) => ({
+      lat: +p.getAttribute("lat"), lon: +p.getAttribute("lon"),
+    }));
+  const nameEl = doc.querySelector("metadata > name") || doc.querySelector("trk > name") || doc.querySelector("rte > name");
+  const name = nameEl?.textContent || "Unnamed Route";
+  return { points: pts, name };
+}
+
+// ════════════════════════════════════════════════════════
+// OVERPASS QUERY GENERATION
+// ════════════════════════════════════════════════════════
+const PRESETS = [
+  { id: "water", label: "Drinking Water", key: "amenity", values: ["drinking_water"] },
+  { id: "toilets", label: "Toilets", key: "amenity", values: ["toilets"] },
+  { id: "food", label: "Food & Drink", key: "amenity", values: ["cafe", "restaurant", "fast_food", "pub", "bar"] },
+  { id: "stores", label: "Stores", key: "shop", values: ["convenience", "supermarket"] },
+  { id: "bikes", label: "Bike Shops", key: "shop", values: ["bicycle"] },
+  { id: "shelter", label: "Shelters", key: "amenity", values: ["shelter"] },
+  { id: "lodging", label: "Accommodation", key: "tourism", values: ["hotel", "hostel", "motel", "camp_site", "guest_house"] },
+  { id: "fuel", label: "Gas Stations", key: "amenity", values: ["fuel"] },
+  { id: "all", label: "All Amenities", key: "amenity", values: null },
+  { id: "custom", label: "Custom\u2026", key: null, values: null },
+];
+
+function mergeFilters(selectedIds, customTag) {
+  const groups = {};
+  const passthrough = [];
+  for (const id of selectedIds) {
+    if (id === "custom") { if (customTag.trim()) passthrough.push(customTag.trim()); continue; }
+    const pr = PRESETS.find((p) => p.id === id);
+    if (!pr || !pr.key) continue;
+    if (!groups[pr.key]) groups[pr.key] = { matchAny: false, vals: new Set() };
+    if (pr.values === null) groups[pr.key].matchAny = true;
+    else pr.values.forEach((v) => groups[pr.key].vals.add(v));
+  }
+  const filters = [];
+  for (const [key, g] of Object.entries(groups)) {
+    if (g.matchAny) { filters.push(`["${key}"]`); }
+    else {
+      const v = [...g.vals];
+      filters.push(v.length === 1 ? `["${key}"="${v[0]}"]` : `["${key}"~"${v.join("|")}"]`);
+    }
+  }
+  return [...filters, ...passthrough];
+}
+
+function buildQuery(poly, filters) {
+  const coords = poly.map((p) => `${p.lat.toFixed(5)} ${p.lon.toFixed(5)}`).join(" ");
+  const lines = filters.map((f) => `  nwr${f}(poly:"${coords}");`).join("\n");
+  return `[out:json][timeout:90];\n(\n${lines}\n);\nout body;\n>;\nout skel qt;`;
+}
+
+function buildGeoJSON(routePts, polyPts) {
+  const features = [];
+  if (routePts && routePts.length >= 2) {
+    features.push({
+      type: "Feature",
+      properties: { name: "GPX Route", stroke: "#e11d48", "stroke-width": 3, "stroke-opacity": 0.9 },
+      geometry: { type: "LineString", coordinates: routePts.map((p) => [+p.lon.toFixed(5), +p.lat.toFixed(5)]) },
+    });
+  }
+  if (polyPts && polyPts.length >= 3) {
+    const ring = polyPts.map((p) => [+p.lon.toFixed(5), +p.lat.toFixed(5)]);
+    ring.push(ring[0]);
+    features.push({
+      type: "Feature",
+      properties: { name: "Buffer Area", stroke: "#3b82f6", "stroke-width": 1, "stroke-opacity": 0.5, fill: "#3b82f6", "fill-opacity": 0.08 },
+      geometry: { type: "Polygon", coordinates: [ring] },
+    });
+  }
+  return { type: "FeatureCollection", features };
+}
+
+// ════════════════════════════════════════════════════════
+// BOUNDING BOX
+// ════════════════════════════════════════════════════════
+function bounds(pts) {
+  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+  for (const p of pts) {
+    if (p.lat < minLat) minLat = p.lat;
+    if (p.lat > maxLat) maxLat = p.lat;
+    if (p.lon < minLon) minLon = p.lon;
+    if (p.lon > maxLon) maxLon = p.lon;
+  }
+  return { minLat, maxLat, minLon, maxLon };
+}
+
+// ════════════════════════════════════════════════════════
+// CLIPBOARD HELPER
+// ════════════════════════════════════════════════════════
+function copyText(text) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    return true;
+  } catch { return false; }
+}
+
+// ════════════════════════════════════════════════════════
+// DROP ZONE
+// ════════════════════════════════════════════════════════
+function DropZone({ onFile }) {
+  const [over, setOver] = useState(false);
+  const [err, setErr] = useState(null);
+  const ref = useRef();
+  const accept = useCallback((f) => {
+    if (!f) return;
+    if (!f.name.toLowerCase().endsWith(".gpx")) { setErr("Please select a .gpx file"); return; }
+    setErr(null); onFile(f);
+  }, [onFile]);
+
+  return (
+    <div
+      onDragOver={(e) => { e.preventDefault(); setOver(true); }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(e) => { e.preventDefault(); setOver(false); accept(e.dataTransfer?.files?.[0]); }}
+      onClick={() => ref.current?.click()}
+      className={`border-2 border-dashed rounded-lg p-16 text-center cursor-pointer transition-colors ${over ? "border-blue-400 bg-blue-50/50" : "border-gray-300 hover:border-gray-400 bg-white"}`}
+    >
+      <input ref={ref} type="file" accept=".gpx" className="hidden" onChange={(e) => accept(e.target.files?.[0])} />
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="mx-auto text-gray-400 mb-3">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
+      </svg>
+      <p className="text-gray-600 font-medium">Drop a .gpx file here</p>
+      <p className="text-gray-400 text-sm mt-1">or click to browse</p>
+      {err && <p className="text-red-500 text-sm mt-2">{err}</p>}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════
+// MAP PREVIEW (SVG)
+// ════════════════════════════════════════════════════════
+function Preview({ track, polygon }) {
+  const W = 800, H = 380, pad = 30;
+  if (!track.length) return null;
+  const all = polygon.length ? [...track, ...polygon] : track;
+  const bb = bounds(all);
+  const midLat = (bb.minLat + bb.maxLat) / 2;
+  const cosLat = Math.cos(rad(midLat));
+  const latR = bb.maxLat - bb.minLat || 0.001;
+  const lonR = (bb.maxLon - bb.minLon) * cosLat || 0.001;
+  const scale = Math.min((W - 2 * pad) / lonR, (H - 2 * pad) / latR);
+  const cx = (W - lonR * scale) / 2;
+  const cy = (H - latR * scale) / 2;
+  const tx = (p) => cx + (p.lon - bb.minLon) * cosLat * scale;
+  const ty = (p) => cy + (bb.maxLat - p.lat) * scale;
+  const polyStr = polygon.map((p) => `${tx(p)},${ty(p)}`).join(" ");
+  const routeStr = track.map((p) => `${tx(p)},${ty(p)}`).join(" ");
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded-lg border border-gray-200" style={{ background: "#f8fafc" }}>
+      {polygon.length > 0 && <polygon points={polyStr} fill="rgba(59,130,246,0.1)" stroke="rgba(59,130,246,0.35)" strokeWidth="1.5" />}
+      <polyline points={routeStr} fill="none" stroke="#e11d48" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx={tx(track[0])} cy={ty(track[0])} r="5" fill="#16a34a" stroke="white" strokeWidth="1.5" />
+      <text x={tx(track[0]) + 8} y={ty(track[0]) + 4} fontSize="11" fill="#16a34a" fontWeight="600">Start</text>
+      <circle cx={tx(track[track.length - 1])} cy={ty(track[track.length - 1])} r="5" fill="#dc2626" stroke="white" strokeWidth="1.5" />
+      <text x={tx(track[track.length - 1]) + 8} y={ty(track[track.length - 1]) + 4} fontSize="11" fill="#dc2626" fontWeight="600">End</text>
+    </svg>
+  );
+}
+
+// ════════════════════════════════════════════════════════
+// MAIN APP
+// ════════════════════════════════════════════════════════
+function App() {
+  const [gpx, setGpx] = useState(null);
+  const [buffer, setBuffer] = useState(800);
+  const [targetPts, setTargetPts] = useState(80);
+  const [selected, setSelected] = useState(new Set(["water"]));
+  const [customTag, setCustomTag] = useState('["amenity"="drinking_water"]');
+  const [copied, setCopied] = useState(false);
+  const [parseErr, setParseErr] = useState(null);
+
+  const togglePreset = useCallback((id) => {
+    setSelected((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  }, []);
+
+  const handleFile = useCallback((file) => {
+    const r = new FileReader();
+    r.onload = (e) => {
+      try {
+        const data = parseGPX(e.target.result);
+        if (data.points.length < 2) { setParseErr("GPX file must contain at least 2 track/route points."); return; }
+        setParseErr(null); setGpx(data);
+      } catch { setParseErr("Could not parse GPX file."); }
+    };
+    r.readAsText(file);
+  }, []);
+
+  const simp = useMemo(() => { if (!gpx) return []; return simplify(gpx.points, targetPts); }, [gpx, targetPts]);
+  const poly = useMemo(() => { if (simp.length < 2) return []; return bufferTrack(simp, buffer); }, [simp, buffer]);
+  const displayTrack = useMemo(() => { if (!gpx) return []; return gpx.points.length > 600 ? simplify(gpx.points, 600) : gpx.points; }, [gpx]);
+  const activeTags = useMemo(() => mergeFilters(selected, customTag), [selected, customTag]);
+  const routeForMap = useMemo(() => { if (!gpx) return []; return gpx.points.length > 120 ? simplify(gpx.points, 120) : gpx.points; }, [gpx]);
+  const query = useMemo(() => { if (!poly.length || !activeTags.length) return ""; return buildQuery(poly, activeTags); }, [poly, activeTags]);
+  const geoJSON = useMemo(() => { if (!routeForMap.length || !poly.length) return null; return buildGeoJSON(routeForMap, poly); }, [routeForMap, poly]);
+  const routeKm = useMemo(() => { if (!gpx) return 0; let t = 0; for (let i = 1; i < gpx.points.length; i++) t += dist(gpx.points[i - 1], gpx.points[i]); return t / 1000; }, [gpx]);
+
+  const copyQuery = useCallback(() => {
+    if (copyText(query)) { setCopied(true); setTimeout(() => setCopied(false), 2000); }
+  }, [query]);
+
+  const openInOT = useCallback(() => {
+    window.open(`https://overpass-turbo.eu/?Q=${encodeURIComponent(query)}&R`, "_blank");
+  }, [query]);
+
+  const openRouteMap = useCallback(() => {
+    if (!geoJSON) return;
+    const json = JSON.stringify(geoJSON);
+    const encoded = encodeURIComponent(json);
+    if (encoded.length < 80000) {
+      window.open(`https://geojson.io/#data=data:application/json,${encoded}`, "_blank");
+    } else {
+      if (copyText(json)) alert("GeoJSON copied to clipboard (URL too long for a direct link).\n\nOpen geojson.io and paste it into the JSON editor on the right.");
+      else alert("Could not copy. Reduce polygon detail and try again.");
+    }
+  }, [geoJSON]);
+
+  // ─── Upload screen ───
+  if (!gpx) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4" style={{ background: "#f1f5f9" }}>
+        <div className="w-full max-w-lg">
+          <h1 className="text-xl font-semibold text-gray-800 mb-0.5 tracking-tight">GPX → Overpass Buffer</h1>
+          <p className="text-sm text-gray-500 mb-5">Generate a buffered polygon query for Overpass Turbo from any GPX route.</p>
+          <DropZone onFile={handleFile} />
+          {parseErr && <p className="text-red-500 text-sm mt-3">{parseErr}</p>}
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Main interface ───
+  return (
+    <div className="min-h-screen p-4" style={{ background: "#f1f5f9" }}>
+      <div className="max-w-4xl mx-auto space-y-4">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-lg font-semibold text-gray-800 truncate tracking-tight" title={gpx.name}>{gpx.name}</h1>
+            <p className="text-sm text-gray-500">{routeKm.toFixed(1)} km &middot; {gpx.points.length.toLocaleString()} track points</p>
+          </div>
+          <button onClick={() => { setGpx(null); setParseErr(null); }} className="shrink-0 text-sm text-gray-500 hover:text-gray-700 px-3 py-1 rounded hover:bg-white/70 transition-colors">↻ New file</button>
+        </div>
+
+        {/* Map preview */}
+        <Preview track={displayTrack} polygon={poly} />
+
+        {/* Controls */}
+        <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-4">
+            {/* Buffer distance */}
+            <div>
+              <div className="flex items-baseline justify-between mb-1.5">
+                <label className="text-sm font-medium text-gray-700">Buffer distance</label>
+                <span className="text-sm tabular-nums font-mono text-gray-500">{buffer >= 1000 ? `${(buffer / 1000).toFixed(1)} km` : `${buffer} m`}</span>
+              </div>
+              <input type="range" min={100} max={5000} step={100} value={buffer} onChange={(e) => setBuffer(+e.target.value)} className="w-full accent-blue-500" />
+              <div className="flex justify-between text-xs text-gray-400 mt-0.5"><span>100 m</span><span>5 km</span></div>
+            </div>
+            {/* Polygon detail */}
+            <div>
+              <div className="flex items-baseline justify-between mb-1.5">
+                <label className="text-sm font-medium text-gray-700">Polygon detail</label>
+                <span className="text-sm tabular-nums font-mono text-gray-500">{simp.length} pts → {poly.length} vertices</span>
+              </div>
+              <input type="range" min={20} max={300} step={5} value={targetPts} onChange={(e) => setTargetPts(+e.target.value)} className="w-full accent-blue-500" />
+              <div className="flex justify-between text-xs text-gray-400 mt-0.5"><span>Coarse (faster)</span><span>Fine (more accurate)</span></div>
+            </div>
+          </div>
+
+          {/* Query presets (multi-select) */}
+          <div>
+            <div className="flex items-baseline justify-between mb-2">
+              <label className="text-sm font-medium text-gray-700">Query filters</label>
+              <span className="text-xs text-gray-400">{selected.size ? `${selected.size} selected` : "select at least one"}</span>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {PRESETS.map((p) => {
+                const on = selected.has(p.id);
+                return (
+                  <button key={p.id} onClick={() => togglePreset(p.id)}
+                    className={`text-sm px-3 py-1 rounded-full border transition-colors ${on ? "bg-blue-50 border-blue-300 text-blue-700 font-medium" : "bg-white border-gray-200 text-gray-600 hover:border-gray-300"}`}>
+                    {on && <span className="inline-block mr-1 text-blue-500">✓</span>}{p.label}
+                  </button>
+                );
+              })}
+            </div>
+            {selected.has("custom") && (
+              <input type="text" value={customTag} onChange={(e) => setCustomTag(e.target.value)}
+                placeholder={'e.g. ["amenity"="parking"]'}
+                className="mt-2.5 w-full px-3 py-2 border border-gray-200 rounded-md text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-300" />
+            )}
+            {selected.size === 0 && <p className="text-xs text-amber-600 mt-2">Select at least one filter to generate a query.</p>}
+          </div>
+        </div>
+
+        {/* Query output */}
+        <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100 bg-gray-50/80">
+            <span className="text-sm text-gray-500">
+              {query
+                ? <>Overpass QL &middot; {activeTags.length} quer{activeTags.length !== 1 ? "ies" : "y"} &middot; <span className="font-mono tabular-nums">{query.length.toLocaleString()}</span> chars</>
+                : "Select at least one filter above"}
+            </span>
+            <div className="flex gap-2">
+              <button onClick={openRouteMap} disabled={!geoJSON} title="Open route + buffer polygon on geojson.io"
+                className="text-sm px-3 py-1 rounded-md bg-gray-100 hover:bg-gray-200 text-gray-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+                View route on map ↗
+              </button>
+              <button onClick={copyQuery} disabled={!query}
+                className="text-sm px-3 py-1 rounded-md bg-gray-100 hover:bg-gray-200 text-gray-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+                {copied ? "✓ Copied" : "Copy"}
+              </button>
+              <button onClick={openInOT} disabled={!query}
+                className="text-sm px-3 py-1 rounded-md bg-blue-500 hover:bg-blue-600 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+                Open in Overpass Turbo ↗
+              </button>
+            </div>
+          </div>
+          <pre className="p-4 text-xs leading-relaxed font-mono text-gray-700 overflow-x-auto whitespace-pre-wrap break-all max-h-72 overflow-y-auto">{query || "// No filters selected"}</pre>
+          {query.length > 6000 && (
+            <div className="px-4 py-2.5 bg-amber-50 border-t border-amber-200 text-sm text-amber-800">
+              Query is {query.length.toLocaleString()} characters — the direct link may exceed browser URL limits. Use <strong>Copy</strong> and paste into Overpass Turbo manually, or reduce polygon detail.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
